@@ -1,7 +1,7 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# MacDJ build and package script
+# Mic Relay build and package script
 # Usage:
 #   ./scripts/build.sh          — build only
 #   ./scripts/build.sh dmg      — build + create .dmg
@@ -10,7 +10,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_DIR/build"
-APP_NAME="MacDJ"
+PROJECT_NAME="MicRelay"
+APP_NAME="Mic Relay"
+LOG_DIR="$BUILD_DIR/logs"
 
 cd "$PROJECT_DIR"
 
@@ -24,12 +26,25 @@ case "${1:-build}" in
 
     build)
         echo "Building $APP_NAME (Release)..."
-        xcodebuild -project "$APP_NAME.xcodeproj" \
-            -scheme "$APP_NAME" \
+        mkdir -p "$LOG_DIR" "$BUILD_DIR/ModuleCache" "$BUILD_DIR/SwiftPM"
+        LOG_FILE="$LOG_DIR/xcodebuild.log"
+
+        if ! env \
+            CLANG_MODULE_CACHE_PATH="$BUILD_DIR/ModuleCache" \
+            SWIFTPM_MODULECACHE_PATH="$BUILD_DIR/ModuleCache" \
+            xcodebuild -project "$PROJECT_NAME.xcodeproj" \
+            -scheme "$PROJECT_NAME" \
             -configuration Release \
             -derivedDataPath "$BUILD_DIR" \
+            -clonedSourcePackagesDirPath "$BUILD_DIR/SourcePackages" \
             -destination "platform=macOS" \
-            build 2>&1 | grep -E "BUILD|error:" || true
+            build > "$LOG_FILE" 2>&1; then
+            grep -E "error:|warning:" "$LOG_FILE" || true
+            echo "Build failed. Full log: $LOG_FILE"
+            exit 1
+        fi
+
+        grep -E "BUILD|warning:" "$LOG_FILE" || true
 
         APP_PATH="$BUILD_DIR/Build/Products/Release/$APP_NAME.app"
         if [ -d "$APP_PATH" ]; then
@@ -70,7 +85,7 @@ case "${1:-build}" in
         else
             # Fallback: plain hdiutil
             echo "  (install create-dmg for a prettier DMG: brew install create-dmg)"
-            TEMP_DMG=$(mktemp -t macdj).dmg
+            TEMP_DMG=$(mktemp -t micrelay).dmg
             hdiutil create -size 50m -fs HFS+ -volname "$APP_NAME" "$TEMP_DMG" > /dev/null
             MOUNT_DIR=$(hdiutil attach "$TEMP_DMG" | tail -1 | awk '{print $3}')
             cp -R "$APP_PATH" "$MOUNT_DIR/"
@@ -84,8 +99,8 @@ case "${1:-build}" in
         echo "DMG: $DMG_PATH"
         echo ""
         echo "Share this file with friends. They should:"
-        echo "  1. Open the DMG, drag MacDJ to Applications"
-        echo "  2. Right-click MacDJ.app → Open (first launch only)"
+        echo "  1. Open the DMG, drag Mic Relay to Applications"
+        echo "  2. Right-click Mic Relay.app → Open (first launch only)"
         echo "  3. Install BlackHole 2ch if prompted"
         ;;
 

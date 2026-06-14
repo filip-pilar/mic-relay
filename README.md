@@ -1,157 +1,161 @@
-# MacDJ
+# Mic Relay
 
-A macOS menu bar app that routes your music into Slack huddles and voice calls with one click.
+Mic Relay is a macOS menu bar app that feeds a virtual microphone for voice-call apps.
 
-Instead of manually creating virtual audio devices in Audio MIDI Setup, MacDJ does it all for you. Play Spotify, YouTube, or anything — your call participants hear the music while you still hear everything through your speakers.
+The v1 signal flow is:
 
-## Modes
+```text
+selected music app, preferably Spotify
+    + optional real microphone
+    -> Mic Relay mixer
+    -> BlackHole 2ch
+    -> selected as microphone in Slack, Discord, Zoom, Meet, etc.
+```
 
-| Mode | Menu Bar Icon | What It Does |
-|---|---|---|
-| **Normal** | `mic` | Standard audio — your mic goes to calls, speakers play audio |
-| **Music + Voice** | `music.mic` | Your music AND voice both go into the call |
-| **DJ** | `music.note.list` | Only music goes into the call (no mic) |
+Mic Relay does not route whole-system audio and does not change the system default output. Keep your call app speaker/output on real headphones or speakers so call audio is not captured back into the virtual mic.
+
+## Status
+
+Mic Relay is early open-source macOS software. The current build is intended for local use and friendly testing, not polished notarized distribution.
 
 ## Requirements
 
-- macOS 14 (Sonoma) or later
-- [BlackHole 2ch](https://existential.audio/blackhole/) virtual audio driver (free, open source)
-- Xcode 15+ (to build from source)
+- macOS 14 Sonoma or later
+- Xcode 16+ to build from source
+- [XcodeGen](https://github.com/yonaskolb/XcodeGen) to regenerate the Xcode project from `project.yml`
+- [BlackHole 2ch](https://existential.audio/blackhole/) as the virtual microphone device
+- Optional: `yt-dlp` and `ffmpeg` for Library downloads
 
-## Quick Start
-
-1. Install BlackHole 2ch:
-   ```bash
-   brew install blackhole-2ch
-   ```
-   Then restart your Mac, or run: `sudo killall -9 coreaudiod`
-
-2. Launch MacDJ — it appears in your menu bar
-
-3. Click the menu bar icon and select **Music + Voice** to start routing music into your calls
-
-4. Use a global hotkey (configurable in Settings) to quickly cycle between modes
-
-## Building from Source
+Install BlackHole:
 
 ```bash
-# Clone the repo
-git clone <repo-url>
-cd mac-dj
+brew install blackhole-2ch
+sudo killall -9 coreaudiod
+```
 
-# Generate the Xcode project (requires xcodegen)
-brew install xcodegen
+Restarting instead of killing `coreaudiod` is also fine.
+
+Install optional Library download tools:
+
+```bash
+brew install yt-dlp ffmpeg
+```
+
+## Build
+
+```bash
 xcodegen generate
-
-# Open in Xcode
-open MacDJ.xcodeproj
-
-# Or build from command line
-xcodebuild -project MacDJ.xcodeproj -scheme MacDJ -configuration Release -derivedDataPath build
+./scripts/build.sh
 ```
 
-The built app is at `build/Build/Products/Release/MacDJ.app`.
+The built app is at:
 
-## Creating a .dmg for Distribution
+```text
+build/Build/Products/Release/Mic Relay.app
+```
+
+Build a DMG:
 
 ```bash
-# Install create-dmg
-brew install create-dmg
-
-# Build release
-xcodebuild -project MacDJ.xcodeproj \
-  -scheme MacDJ \
-  -configuration Release \
-  -derivedDataPath build
-
-# Ad-hoc sign (no Apple Developer account needed)
-codesign --force --deep --sign - "build/Build/Products/Release/MacDJ.app"
-
-# Create the DMG
-create-dmg \
-  --volname "MacDJ" \
-  --window-size 600 400 \
-  --icon-size 100 \
-  --icon "MacDJ.app" 175 190 \
-  --app-drop-link 425 190 \
-  "MacDJ.dmg" \
-  "build/Build/Products/Release/MacDJ.app"
+./scripts/build.sh dmg
 ```
 
-## Sharing with Friends
+The DMG build is ad-hoc signed. Friends may need to right-click the app and choose Open on first launch unless you distribute a Developer ID signed and notarized build.
 
-Share the `MacDJ.dmg` file via AirDrop, iMessage, Google Drive, etc.
+## Use
 
-**Recipients:**
+1. Start Spotify or another music app.
+2. Launch Mic Relay.
+3. Grant Microphone permission if you want to include your mic.
+4. Grant Screen & System Audio Recording permission when macOS asks for app-audio capture.
+5. In Mic Relay, choose the music source and microphone.
+6. Turn Routing on. Use Include microphone to choose music-only or music plus voice.
+7. In the call app, set microphone/input to BlackHole 2ch.
+8. In the call app, keep speaker/output set to real headphones or speakers.
 
-1. Open the DMG and drag **MacDJ** to **Applications**
-2. **First launch only:** Right-click `MacDJ.app` → **Open** → click **Open** in the dialog
-   - This is a one-time Gatekeeper bypass since the app isn't notarized
-   - Alternatively: System Settings → Privacy & Security → scroll down → "Open Anyway"
-3. MacDJ will prompt to install BlackHole 2ch if it's not already installed
-4. Click the menu bar icon to switch modes
+## Privacy and Safety
 
-## How It Works
+- App audio capture uses ScreenCaptureKit and is scoped to the selected app.
+- Mic Relay does not capture whole-system audio.
+- Mic Relay does not set or change the system default audio output.
+- Microphone permission is only needed when you include your physical microphone.
+- Downloaded Library and Soundboard files live locally under `~/Music/Mic Relay/`.
+- BlackHole 2ch is a separate virtual audio driver and must be installed by the user.
 
-MacDJ uses macOS CoreAudio APIs to programmatically create two virtual audio devices:
+## Validation
 
-- **Multi-Output Device** — sends the same audio to both your speakers/headphones AND BlackHole 2ch. This way you hear your music while it also flows through the virtual cable.
-- **Aggregate Device** — combines your real microphone and BlackHole 2ch into one input device. When Slack uses this as its mic, it receives both your voice and your music.
+List audio devices and verify BlackHole:
 
-When you switch modes, MacDJ:
-1. Creates a **Multi-Output Device** that sends audio to both your speakers and BlackHole
-2. Sets the system default input to BlackHole (so Slack reads from it)
-3. In **Music + Voice** mode, runs a lightweight audio engine that routes your mic into BlackHole alongside the music — CoreAudio mixes both streams automatically
+```bash
+./scripts/probe-audio.sh
+```
 
-When you quit, it cleans up virtual devices and restores your original audio settings.
+Write a generated tone into BlackHole:
 
-No kernel extensions, no system modifications, no audio quality loss.
+```bash
+./scripts/probe-audio.sh --tone-to-blackhole
+```
+
+For the tone test, select BlackHole 2ch as a microphone in a call app or a recording app and confirm the tone appears on the input meter.
+
+### Manual Echo Checklist
+
+- Call app input is BlackHole 2ch.
+- Call app output is real headphones/speakers, not BlackHole 2ch.
+- Mic Relay music source is Spotify or the intended music app, not the call app.
+- Other participants hear music in Music Only mode.
+- Other participants do not hear your mic in Music Only mode.
+- Other participants hear music and your mic when Include microphone is on.
+- Other participants do not hear themselves come back after they speak.
+
+## Architecture Notes
+
+- App-specific music capture uses ScreenCaptureKit with an application content filter.
+- Physical microphone capture uses AVFoundation and passes the selected `AVCaptureDevice` into the mixer.
+- The mixer uses AVAudioEngine and writes its output directly to BlackHole 2ch.
+- BlackHole is used as a virtual mic any call app can select.
+- Local music monitoring is provided by the music app's normal playback path; Mic Relay does not need to mirror call audio or system output.
+- DRM/protected audio may be unavailable or silent depending on the source app and OS behavior.
+
+## Releasing
+
+For a quick friend build:
+
+```bash
+./scripts/build.sh dmg
+```
+
+Attach `Mic Relay.dmg` to a GitHub Release with short install notes:
+
+1. Install BlackHole 2ch.
+2. Open the DMG and drag Mic Relay to Applications.
+3. Right-click Mic Relay and choose Open on first launch if macOS blocks it.
+4. Select BlackHole 2ch as the microphone/input in the call app.
+
+For broader distribution, use an Apple Developer ID certificate and notarize the app or DMG. That avoids most Gatekeeper friction and is more important than whether the repository is public.
+
+## Contributing
+
+Please keep changes scoped to the app's v1 audio model: selected app audio plus optional physical microphone into BlackHole 2ch. Avoid whole-system capture, multi-output devices, or changing the user's default output unless the project intentionally changes direction.
 
 ## Troubleshooting
 
-**"BlackHole 2ch not installed"**
-- Install it: `brew install blackhole-2ch`
-- After installing, restart your Mac or run `sudo killall -9 coreaudiod`
-- Click "Rescan Audio Devices" in the MacDJ menu
+**BlackHole is missing**
 
-**No sound after switching modes**
-- Open **Audio MIDI Setup** (in /Applications/Utilities/) and verify the MacDJ devices are listed
-- Check that the sample rate matches across devices (48000 Hz is typical)
-- Switch back to Normal mode and try again
+Install BlackHole 2ch, restart the audio daemon or reboot, then click Refresh in Mic Relay.
 
-**Music not reaching the call**
-- Make sure your music app is playing to the system default output (not a specific device)
-- In Slack/Zoom/etc., check that the input device is set to "Default" or "BlackHole 2ch"
-- MacDJ must be running for Music + Voice mode to work (it actively routes mic audio)
+**No music sources appear**
 
-**"Can't be opened because Apple cannot check it for malicious software"**
-- Right-click the app → Open → click Open
-- Or: System Settings → Privacy & Security → Open Anyway
+Start Spotify or another audio app, then click Refresh. If macOS has not granted Screen & System Audio Recording permission, enable it in System Settings > Privacy & Security.
 
-**App crashed and left virtual devices behind**
-- Just relaunch MacDJ — it automatically cleans up orphaned devices on startup
-- Or open Audio MIDI Setup and manually delete any "MacDJ:" devices
+**The call hears nothing**
 
-## Optional: Notarized Distribution
+Make sure Mic Relay is routing, BlackHole 2ch is selected as the call app microphone, and the Output meter is moving.
 
-If you want to distribute without Gatekeeper warnings, you need an [Apple Developer account](https://developer.apple.com/programs/) ($99/year):
+**Echo**
 
-```bash
-# Sign with Developer ID
-codesign --force --deep \
-  --sign "Developer ID Application: Your Name (TEAMID)" \
-  --options runtime --timestamp \
-  --entitlements MacDJ/MacDJ.entitlements \
-  "MacDJ.app"
-
-# Notarize (takes 1-5 minutes)
-xcrun notarytool submit MacDJ.dmg \
-  --keychain-profile "notary" --wait
-
-# Staple the ticket
-xcrun stapler staple MacDJ.dmg
-```
+Make sure the call app output is not BlackHole 2ch and that the selected Mic Relay source is not the call app.
 
 ## License
 
-MIT
+Mic Relay is available under the MIT License. See [LICENSE](LICENSE).

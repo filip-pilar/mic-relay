@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="150" y1="80" x2="874" y2="944" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#20242c"/>
+      <stop offset="1" stop-color="#080a0f"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="190" y1="260" x2="834" y2="764" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8bd6ff"/>
+      <stop offset="0.52" stop-color="#0a84ff"/>
+      <stop offset="1" stop-color="#8f7cff"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="210" fill="url(#bg)"/>
+  <path d="M168 526v88" fill="none" stroke="url(#mark)" stroke-width="64" stroke-linecap="round"/>
+  <path d="M306 392v286" fill="none" stroke="url(#mark)" stroke-width="64" stroke-linecap="round"/>
+  <path d="M444 276v472" fill="none" stroke="url(#mark)" stroke-width="64" stroke-linecap="round"/>
+  <path d="M580 446v132" fill="none" stroke="url(#mark)" stroke-width="64" stroke-linecap="round"/>
+  <path d="M718 354v324" fill="none" stroke="url(#mark)" stroke-width="64" stroke-linecap="round"/>
+  <path d="M856 526v88" fill="none" stroke="url(#mark)" stroke-width="64" stroke-linecap="round"/>
+</svg>
