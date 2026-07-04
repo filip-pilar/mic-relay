@@ -5,8 +5,9 @@ macOS menu bar app that feeds a virtual microphone for call apps using app-speci
 ## Project Setup
 
 - Swift 6, SwiftUI, macOS 14+
-- Xcode project generated via `xcodegen generate` from `project.yml`
+- Generate/refresh the Xcode project before the first build and after `project.yml` changes: `xcodegen generate`
 - No Swift package dependencies
+- Optional Library download support uses external `yt-dlp` and `ffmpeg` CLIs; they are not Swift package dependencies.
 - Build: `./scripts/build.sh` or `./scripts/build.sh dmg`
 - Probe: `./scripts/probe-audio.sh` or `./scripts/probe-audio.sh --tone-to-blackhole`
 
@@ -25,17 +26,23 @@ Mic Relay intentionally does not create a multi-output device, does not set defa
 ## Important Files
 
 ```text
-MicRelay/Audio/AppAudioCapture.swift      — ScreenCaptureKit app-specific music capture
-MicRelay/Audio/MicrophoneCapture.swift    — AVFoundation physical microphone capture
-MicRelay/Audio/AudioMixer.swift           — AVAudioEngine music/mic mixer -> BlackHole
-MicRelay/Audio/AudioDeviceManager.swift   — CoreAudio device enumeration and change listener
-MicRelay/Audio/AudioDeviceTypes.swift     — AudioMode, MusicSource, DeviceInfo, levels, constants
-MicRelay/Audio/BlackHoleDetector.swift    — Detects BlackHole 2ch installation
-MicRelay/App/AppState.swift               — Observable app state and routing lifecycle
-MicRelay/App/MenuBarView.swift            — Menu bar control surface
-MicRelay/App/OnboardingView.swift         — BlackHole install guide
-MicRelay/MicRelayApp.swift                — @main, MenuBarExtra
-test-audio.swift                          — Audio device and BlackHole tone probe
+MicRelay/Audio/AppAudioCapture.swift            — ScreenCaptureKit app-specific music capture
+MicRelay/Audio/MicrophoneCapture.swift          — AVFoundation physical microphone capture
+MicRelay/Audio/AudioMixer.swift                 — AVAudioEngine music/mic mixer -> BlackHole
+MicRelay/Audio/AudioDeviceManager.swift         — CoreAudio device enumeration and change listener
+MicRelay/Audio/AudioDeviceTypes.swift           — AudioMode, MusicSource, DeviceInfo, levels, constants
+MicRelay/Audio/AudioSampleConverter.swift       — sample format conversion helpers
+MicRelay/Audio/BlackHoleDetector.swift          — Detects BlackHole 2ch installation
+MicRelay/Audio/LocalFilePlaybackEngine.swift    — short local file playback
+MicRelay/Audio/LongFormFilePlaybackEngine.swift — long-form local file playback
+MicRelay/App/AppState.swift                     — Observable app state and routing lifecycle
+MicRelay/App/LibraryDownloader.swift            — optional yt-dlp/ffmpeg download flow
+MicRelay/App/LibraryState.swift                 — Library tab state
+MicRelay/App/MenuBarView.swift                  — Menu bar control surface
+MicRelay/App/OnboardingView.swift               — BlackHole install guide
+MicRelay/App/SoundboardState.swift              — Soundboard tab state
+MicRelay/MicRelayApp.swift                      — @main, MenuBarExtra
+test-audio.swift                                — Audio device and BlackHole tone probe
 ```
 
 ## Permissions
@@ -66,4 +73,3 @@ test-audio.swift                          — Audio device and BlackHole tone pr
 
 - DRM/protected audio may be silent depending on the app and macOS behavior.
 - Friend-friendly notarized distribution is not v1.
-- DRM/protected audio may be silent depending on the app and macOS behavior.
