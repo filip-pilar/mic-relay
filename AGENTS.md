@@ -1,75 +1,20 @@
 # Mic Relay
 
-macOS menu bar app that feeds a virtual microphone for call apps using app-specific music capture plus an optional real microphone.
+Swift 6 / SwiftUI app with a menu bar shortcut, macOS 14+. No Swift package dependencies.
 
-## Project Setup
+- Capture one selected app through ScreenCaptureKit, optionally mix a physical microphone, and write to BlackHole 2ch. Never capture whole-system audio, create aggregate/multi-output devices, or change system audio defaults. Call output stays on real headphones/speakers to prevent echo.
+- Request microphone permission only when Include microphone is enabled. App discovery/capture can prompt for Screen & System Audio Recording; keep first access user-initiated. Accessibility permission is not needed. The microphone picker excludes BlackHole.
+- One Start/Stop Sharing control governs outgoing audio. Library and Soundboard preview locally while stopped; starting or stopping sharing stops existing playback. Library supports seeking and playlist folders; Soundboard supports overlapping clips.
+- Preserve files and label metadata under `~/Music/Mic Relay/`. Library metadata keys are relative paths; Soundboard keys are absolute paths. Downloads optionally use external `yt-dlp` and `ffmpeg`.
+- `AudioSampleConverter` handles capture formats; `AudioMixer` bridges capture/render callbacks with a bounded queue and no volume gate. Audio callbacks must not inherit MainActor isolation. Meter updates are sampled at a fixed rate. Both file features use `FilePlaybackEngine`.
+- `project.yml` defines the Xcode project and version. The checked-in plist and entitlements define app metadata and permissions; the Xcode project is generated and ignored.
+- Keep the local signing identity stable across Xcode builds and DMGs; ad-hoc signing can invalidate macOS permission grants. `./scripts/setup-signing.sh` provisions the identity once in the user's Keychain. Never regenerate it during a build or reset privacy permissions as a build step.
 
-- Swift 6, SwiftUI, macOS 14+
-- Generate/refresh the Xcode project before the first build and after `project.yml` changes: `xcodegen generate`
-- No Swift package dependencies
-- Optional Library download support uses external `yt-dlp` and `ffmpeg` CLIs; they are not Swift package dependencies.
-- Build: `./scripts/build.sh` or `./scripts/build.sh dmg`
-- Probe: `./scripts/probe-audio.sh` or `./scripts/probe-audio.sh --tone-to-blackhole`
+Commands:
 
-## v1 Architecture
+- `./scripts/build.sh` generates the project and builds Release; `dmg` also packages it and `clean` removes build artifacts.
+- `./scripts/check.sh` runs deterministic conversion, buffer, completion, and import checks using disposable inputs.
+- `./scripts/check.sh --audio` exercises real BlackHole output/readback, file playback, and routing lifecycle. It writes synthetic tones to BlackHole and uses silent temporary files; it does not start a physical microphone or change system audio defaults. Run outside a live call.
+- `./scripts/probe-audio.sh` independently lists audio devices; `--tone-to-blackhole` writes a five-second tone to BlackHole.
 
-```text
-selected music app, preferably Spotify
-    + optional selected microphone
-    -> AVAudioEngine mixer
-    -> BlackHole 2ch
-    -> user selects BlackHole 2ch as mic in any call app
-```
-
-Mic Relay intentionally does not create a multi-output device, does not set default system output, and does not capture whole-system audio. The call app output must stay on real headphones/speakers to avoid echo.
-
-## Important Files
-
-```text
-MicRelay/Audio/AppAudioCapture.swift            — ScreenCaptureKit app-specific music capture
-MicRelay/Audio/MicrophoneCapture.swift          — AVFoundation physical microphone capture
-MicRelay/Audio/AudioMixer.swift                 — AVAudioEngine music/mic mixer -> BlackHole
-MicRelay/Audio/AudioDeviceManager.swift         — CoreAudio device enumeration and change listener
-MicRelay/Audio/AudioDeviceTypes.swift           — AudioMode, MusicSource, DeviceInfo, levels, constants
-MicRelay/Audio/AudioSampleConverter.swift       — sample format conversion helpers
-MicRelay/Audio/BlackHoleDetector.swift          — Detects BlackHole 2ch installation
-MicRelay/Audio/LocalFilePlaybackEngine.swift    — short local file playback
-MicRelay/Audio/LongFormFilePlaybackEngine.swift — long-form local file playback
-MicRelay/App/AppState.swift                     — Observable app state and routing lifecycle
-MicRelay/App/LibraryDownloader.swift            — optional yt-dlp/ffmpeg download flow
-MicRelay/App/LibraryState.swift                 — Library tab state
-MicRelay/App/MenuBarView.swift                  — Menu bar control surface
-MicRelay/App/OnboardingView.swift               — BlackHole install guide
-MicRelay/App/SoundboardState.swift              — Soundboard tab state
-MicRelay/MicRelayApp.swift                      — @main, MenuBarExtra
-test-audio.swift                                — Audio device and BlackHole tone probe
-```
-
-## Permissions
-
-- Microphone permission is required only when Include microphone is enabled.
-- Screen & System Audio Recording permission is required for ScreenCaptureKit app-audio capture.
-- BlackHole 2ch must be installed separately.
-
-## Current UX Decisions
-
-- The menu bar label uses `dot.radiowaves.left.and.right`, which is intentionally simpler than the old waveform symbol at menu bar size.
-- The menu UI has four top-level tabs: Stream, Library, Soundboard, and Config.
-- The main Stream action starts/stops writing the mixed signal to BlackHole.
-- Level meters show live signal only while audio is being sent. They should occupy stable space and never change the menu height.
-- The microphone picker uses AVFoundation microphone devices and intentionally excludes BlackHole.
-
-## Validation Checklist
-
-1. `./scripts/probe-audio.sh` finds BlackHole 2ch.
-2. `./scripts/probe-audio.sh --tone-to-blackhole` moves the input meter in a call/recording app with BlackHole selected as mic.
-3. Spotify appears as the preferred music source when running.
-4. Music Only sends music to BlackHole without mic.
-5. Music + Voice sends music and selected mic to BlackHole.
-6. Call app output remains real headphones/speakers.
-7. Other participants do not hear themselves echoed back.
-
-## Known Limits
-
-- DRM/protected audio may be silent depending on the app and macOS behavior.
-- Friend-friendly notarized distribution is not v1.
+See [README.md](README.md) for setup, troubleshooting, and manual validation. Use checks relevant to the change; device checks need CoreAudio access outside a restrictive sandbox. End-to-end Slack reception cannot be inferred from compilation or a moving meter alone.
