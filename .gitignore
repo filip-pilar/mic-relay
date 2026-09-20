@@ -4,11 +4,7 @@
 
 build/
 *.xcodeproj/
-*.xcodeproj/xcuserdata/
-*.xcodeproj/project.xcworkspace/xcuserdata/
 DerivedData/
-.swiftpm/
 *.dmg
 *.xcarchive
-*.ipa
 *.app

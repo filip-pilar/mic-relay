@@ -1,10 +1,8 @@
 name: MicRelay
 options:
-  bundleIdPrefix: com.micrelay
   deploymentTarget:
     macOS: "14.0"
   xcodeVersion: "16.0"
-  generateEmptyDirectories: true
 
 targets:
   MicRelay:
@@ -21,21 +19,9 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: MicRelay/Info.plist
         CODE_SIGN_ENTITLEMENTS: MicRelay/MicRelay.entitlements
-        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: Mic Relay Local Development
         ENABLE_HARDENED_RUNTIME: YES
-        COMBINE_HIDPI_IMAGES: YES
-    info:
-      path: MicRelay/Info.plist
-      properties:
-        LSUIElement: true
-        NSMicrophoneUsageDescription: "Mic Relay needs microphone access to route your mic into voice calls alongside music."
-        NSAudioCaptureUsageDescription: "Mic Relay captures audio from your selected music app so it can feed BlackHole as a virtual microphone."
-        NSScreenCaptureUsageDescription: "Mic Relay uses ScreenCaptureKit to capture audio from the selected music app without capturing call audio."
-        CFBundleName: "Mic Relay"
-        CFBundleDisplayName: "Mic Relay"
-        CFBundleShortVersionString: "1.0.0"
-        CFBundleVersion: "1"
-    entitlements:
-      path: MicRelay/MicRelay.entitlements
-      properties:
-        com.apple.security.device.audio-input: true
+      configs:
+        Release:
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
