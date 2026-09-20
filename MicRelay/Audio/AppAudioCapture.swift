@@ -6,12 +6,9 @@ import Foundation
 @MainActor
 final class AppAudioCapture: NSObject {
     private var stream: SCStream?
-    private let output = StreamOutput()
-
-    var onAudioBuffer: ((AVAudioPCMBuffer) -> Void)? {
-        get { output.onAudioBuffer }
-        set { output.onAudioBuffer = newValue }
-    }
+    private var output: StreamOutput?
+    var onAudioBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    var onFailure: (@MainActor (Error) -> Void)?
 
     func availableSources() async throws -> [MusicSource] {
         let content = try await SCShareableContent.current
@@ -85,7 +82,8 @@ final class AppAudioCapture: NSObject {
     }
 
     func start(source: MusicSource) async throws {
-        stop()
+        await stop()
+        try Task.checkCancellation()
 
         let content: SCShareableContent
         do {
@@ -94,6 +92,7 @@ final class AppAudioCapture: NSObject {
             throw MicRelayError.screenCapturePermissionRequired
         }
 
+        try Task.checkCancellation()
         guard let display = content.displays.first else {
             throw MicRelayError.captureFailed("No display is available for the capture filter")
         }
@@ -121,24 +120,37 @@ final class AppAudioCapture: NSObject {
         configuration.sampleRate = Int(MicRelayConstants.sampleRate)
         configuration.channelCount = MicRelayConstants.channelCount
 
+        let output = StreamOutput()
+        output.onAudioBuffer = onAudioBuffer
+        output.onFailure = { [weak self] failedStream, error in
+            guard let self, self.stream === failedStream else { return }
+            self.onFailure?(error)
+        }
         let stream = SCStream(filter: filter, configuration: configuration, delegate: output)
         try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: output.queue)
-        try await stream.startCapture()
+        self.output = output
         self.stream = stream
+        do {
+            try await stream.startCapture()
+            try Task.checkCancellation()
+        } catch {
+            await stop()
+            throw error
+        }
     }
 
-    func stop() {
+    func stop() async {
         guard let stream else { return }
         self.stream = nil
-        Task {
-            try? await stream.stopCapture()
-        }
+        try? await stream.stopCapture()
+        output = nil
     }
 }
 
 private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     let queue = DispatchQueue(label: "com.micrelay.screencapture.audio")
-    var onAudioBuffer: ((AVAudioPCMBuffer) -> Void)?
+    var onAudioBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    var onFailure: (@MainActor (SCStream, Error) -> Void)?
     private let appAudioConverter = AudioSampleConverter(outputFormat: MicRelayConstants.processingFormat)
 
     func stream(
@@ -154,6 +166,7 @@ private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @u
             return
         }
     }
-
-    func stream(_ stream: SCStream, didStopWithError error: Error) {}
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        Task { @MainActor in onFailure?(stream, error) }
+    }
 }

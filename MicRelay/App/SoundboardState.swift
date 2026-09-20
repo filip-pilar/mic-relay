@@ -22,23 +22,21 @@ final class SoundboardState {
 
     let folderURL: URL
 
-    private let playbackEngine = LocalFilePlaybackEngine()
+    private let playbackEngine = FilePlaybackEngine()
     private let defaultEmoji = "🙂"
-    private let supportedExtensions: Set<String> = [
-        "aac", "aif", "aifc", "aiff", "caf", "flac", "m4a", "m4r",
-        "mp3", "mp4", "sd2", "wav"
-    ]
     private var playbackByID: [UUID: String] = [:]
     private var metadata = SoundboardMetadataFile()
 
-    init() {
-        folderURL = FileManager.default.homeDirectoryForCurrentUser
+    init(folderURL: URL? = nil) {
+        self.folderURL = folderURL ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Music", isDirectory: true)
             .appendingPathComponent("Mic Relay", isDirectory: true)
             .appendingPathComponent("Soundboard", isDirectory: true)
-        ensureFolder()
-        loadMetadata()
         refresh()
+        playbackEngine.onInterruption = { [weak self] in
+            self?.stopAll()
+            self?.lastErrorMessage = "Audio output changed. Play a clip again to continue."
+        }
     }
 
     var filteredSounds: [SoundboardItem] {
@@ -55,6 +53,16 @@ final class SoundboardState {
         !playingSoundIDs.isEmpty
     }
 
+    func importFiles(_ urls: [URL]) {
+        do {
+            try AudioFileSupport.importFiles(urls, into: folderURL)
+            refresh()
+        } catch {
+            refresh()
+            lastErrorMessage = error.localizedDescription
+        }
+    }
+
     func openFolder() {
         ensureFolder()
         NSWorkspace.shared.open(folderURL)
@@ -62,12 +70,12 @@ final class SoundboardState {
     }
 
     func refresh() {
+        lastErrorMessage = nil
         ensureFolder()
         loadMetadata()
         let discoveredSounds = discoverSounds()
         sounds = discoveredSounds
         playingSoundIDs = playingSoundIDs.intersection(Set(discoveredSounds.map(\.id)))
-        lastErrorMessage = nil
         statusMessage = discoveredSounds.isEmpty
             ? "Drop audio files into the folder."
             : "\(discoveredSounds.count) sound\(discoveredSounds.count == 1 ? "" : "s") ready."
@@ -97,7 +105,7 @@ final class SoundboardState {
             statusMessage = sendToCall ? "Playing \(sound.name) to call." : "Previewing \(sound.name)."
         } catch {
             refresh()
-            lastErrorMessage = Self.shortError(error)
+            lastErrorMessage = AudioFileSupport.playbackErrorMessage(error)
         }
     }
 
@@ -110,19 +118,19 @@ final class SoundboardState {
 
     func updateMetadata(for sound: SoundboardItem, name: String, emoji: String) {
         let cleanedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanedEmoji = Self.cleanEmoji(emoji) ?? defaultEmoji
+        let cleanedEmoji = AudioFileSupport.cleanEmoji(emoji) ?? defaultEmoji
         metadata.sounds[sound.id] = SoundboardSoundMetadata(
             name: cleanedName.isEmpty ? nil : cleanedName,
             emoji: cleanedEmoji
         )
-        saveMetadata()
+        guard saveMetadata() else { return }
         refresh()
         statusMessage = "Updated \(cleanedName.isEmpty ? sound.name : cleanedName)."
     }
 
     func clearMetadata(for sound: SoundboardItem) {
         metadata.sounds.removeValue(forKey: sound.id)
-        saveMetadata()
+        guard saveMetadata() else { return }
         refresh()
         statusMessage = "Reset \(sound.filename)."
     }
@@ -153,7 +161,7 @@ final class SoundboardState {
 
         return urls.compactMap { url in
             let fileExtension = url.pathExtension.lowercased()
-            guard supportedExtensions.contains(fileExtension) else { return nil }
+            guard AudioFileSupport.supportedExtensions.contains(fileExtension) else { return nil }
 
             let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
             guard values?.isRegularFile != false else { return nil }
@@ -188,14 +196,6 @@ final class SoundboardState {
         }
     }
 
-    private static func shortError(_ error: Error) -> String {
-        let message = error.localizedDescription
-        if message == "The operation couldn’t be completed. (com.apple.coreaudio.avfaudio error 1685348671.)" {
-            return "That file could not be played."
-        }
-        return message
-    }
-
     private func loadMetadata() {
         guard let data = try? Data(contentsOf: metadataURL) else {
             metadata = SoundboardMetadataFile()
@@ -210,22 +210,18 @@ final class SoundboardState {
         }
     }
 
-    private func saveMetadata() {
+    private func saveMetadata() -> Bool {
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(metadata)
             try data.write(to: metadataURL, options: .atomic)
             lastErrorMessage = nil
+            return true
         } catch {
             lastErrorMessage = "Soundboard labels could not be saved."
+            return false
         }
-    }
-
-    private static func cleanEmoji(_ value: String) -> String? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let first = trimmed.first else { return nil }
-        return String(first)
     }
 
     private static func cleanName(from url: URL) -> String {
@@ -251,11 +247,4 @@ private struct SoundboardMetadataFile: Codable {
 private struct SoundboardSoundMetadata: Codable {
     var name: String?
     var emoji: String?
-}
-
-private extension String {
-    var nilIfBlank: String? {
-        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
 }

@@ -14,53 +14,24 @@ final class AudioSampleConverter: @unchecked Sendable {
     func convert(sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
         guard sampleBuffer.isValid, sampleBuffer.numSamples > 0 else { return nil }
         guard let sourceBuffer = makePCMBuffer(from: sampleBuffer) else { return nil }
-        return convertToOutputFormat(sourceBuffer) ?? sourceBuffer
+        return convertToOutputFormat(sourceBuffer)
     }
 
     private func makePCMBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else { return nil }
         let sourceFormat = AVAudioFormat(cmAudioFormatDescription: formatDescription)
 
-        var neededSize = 0
-        var blockBuffer: CMBlockBuffer?
-        var status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sampleBuffer,
-            bufferListSizeNeededOut: &neededSize,
-            bufferListOut: nil,
-            bufferListSize: 0,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
-        guard status == noErr, neededSize > 0 else { return nil }
-
-        let rawBufferList = UnsafeMutableRawPointer.allocate(
-            byteCount: neededSize,
-            alignment: MemoryLayout<AudioBufferList>.alignment
-        )
-        defer { rawBufferList.deallocate() }
-
-        let audioBufferList = rawBufferList.bindMemory(to: AudioBufferList.self, capacity: 1)
-        status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sampleBuffer,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: audioBufferList,
-            bufferListSize: neededSize,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
-        guard status == noErr else { return nil }
-
-        guard let sourceBuffer = AVAudioPCMBuffer(
+        guard let buffer = AVAudioPCMBuffer(
             pcmFormat: sourceFormat,
-            bufferListNoCopy: UnsafePointer(audioBufferList)
+            frameCapacity: AVAudioFrameCount(sampleBuffer.numSamples)
         ) else { return nil }
-        sourceBuffer.frameLength = AVAudioFrameCount(sampleBuffer.numSamples)
-
-        return copyBuffer(sourceBuffer)
+        buffer.frameLength = buffer.frameCapacity
+        // CoreMedia copies every PCM layout, including interleaved and integer audio.
+        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer, at: 0, frameCount: Int32(buffer.frameLength),
+            into: buffer.mutableAudioBufferList
+        )
+        return status == noErr ? buffer : nil
     }
 
     private func convertToOutputFormat(_ sourceBuffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
@@ -98,31 +69,6 @@ final class AudioSampleConverter: @unchecked Sendable {
         return error == nil ? outputBuffer : nil
     }
 
-    private func copyBuffer(_ sourceBuffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        guard let copy = AVAudioPCMBuffer(
-            pcmFormat: sourceBuffer.format,
-            frameCapacity: sourceBuffer.frameLength
-        ) else { return nil }
-
-        copy.frameLength = sourceBuffer.frameLength
-        let frameLength = Int(sourceBuffer.frameLength)
-
-        if let source = sourceBuffer.floatChannelData, let destination = copy.floatChannelData {
-            for channel in 0..<Int(sourceBuffer.format.channelCount) {
-                destination[channel].update(from: source[channel], count: frameLength)
-            }
-            return copy
-        }
-
-        if let source = sourceBuffer.int16ChannelData, let destination = copy.int16ChannelData {
-            for channel in 0..<Int(sourceBuffer.format.channelCount) {
-                destination[channel].update(from: source[channel], count: frameLength)
-            }
-            return copy
-        }
-
-        return nil
-    }
 }
 
 private final class ConverterInputBox: @unchecked Sendable {

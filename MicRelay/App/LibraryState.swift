@@ -44,25 +44,24 @@ final class LibraryState {
 
     let folderURL: URL
 
-    private let playbackEngine = LongFormFilePlaybackEngine()
+    private let playbackEngine = FilePlaybackEngine()
+    private var playbackID: UUID?
     private let downloader = LibraryDownloader()
     private let defaultEmoji = "🎵"
-    private let supportedExtensions: Set<String> = [
-        "aac", "aif", "aifc", "aiff", "caf", "flac", "m4a", "m4r",
-        "mp3", "mp4", "sd2", "wav"
-    ]
     private var metadata = LibraryMetadataFile()
     private var progressTimer: Timer?
     private var downloadTask: Task<Void, Never>?
 
-    init() {
-        folderURL = FileManager.default.homeDirectoryForCurrentUser
+    init(folderURL: URL? = nil) {
+        self.folderURL = folderURL ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Music", isDirectory: true)
             .appendingPathComponent("Mic Relay", isDirectory: true)
             .appendingPathComponent("Library", isDirectory: true)
-        ensureFolder()
-        loadMetadata()
         refresh()
+        playbackEngine.onInterruption = { [weak self] in
+            self?.pause()
+            self?.lastErrorMessage = "Audio output changed. Press Play to resume."
+        }
         startProgressTimer()
         updateToolStatusMessage()
     }
@@ -87,6 +86,16 @@ final class LibraryState {
 
     var toolStatus: DownloaderToolStatus {
         downloader.toolStatus
+    }
+
+    func importFiles(_ urls: [URL]) {
+        do {
+            try AudioFileSupport.importFiles(urls, into: folderURL)
+            refresh()
+        } catch {
+            refresh()
+            lastErrorMessage = error.localizedDescription
+        }
     }
 
     func openFolder() {
@@ -129,10 +138,11 @@ final class LibraryState {
             guard let self else { return }
             do {
                 try await downloader.download(urlString: urlText, into: folderURL) { [weak self] message, progress in
-                    guard let self else { return }
+                    guard let self, downloadTask?.isCancelled == false else { return }
                     statusMessage = message
                     downloadProgress = progress
                 }
+                try Task.checkCancellation()
                 importURLText = ""
                 isDownloading = false
                 downloadProgress = nil
@@ -152,12 +162,11 @@ final class LibraryState {
     }
 
     func cancelDownload() {
+        guard isDownloading else { return }
         downloadTask?.cancel()
         downloader.cancel()
-        downloadTask = nil
-        isDownloading = false
         downloadProgress = nil
-        statusMessage = "Download canceled."
+        statusMessage = "Canceling download…"
     }
 
     func play(_ track: LibraryTrack, sendToCall: Bool, virtualMicDeviceID: AudioDeviceID?) {
@@ -172,22 +181,24 @@ final class LibraryState {
         }
 
         do {
-            try playbackEngine.play(
+            playbackEngine.stopAll()
+            playbackID = try playbackEngine.play(
                 url: track.url,
                 virtualMicDeviceID: sendToCall ? virtualMicDeviceID : nil
-            ) { [weak self] in
+            ) { [weak self] _ in
                 self?.finishPlayback()
             }
             nowPlayingTrackID = track.id
             nowPlayingTitle = track.title
-            playbackDuration = playbackEngine.duration
+            playbackDuration = playbackID.map { playbackEngine.duration($0) } ?? 0
             playbackTime = 0
             isPlaying = true
             lastErrorMessage = nil
             statusMessage = sendToCall ? "Playing \(track.title) to call." : "Previewing \(track.title)."
         } catch {
+            stop()
             refresh()
-            lastErrorMessage = Self.shortError(error)
+            lastErrorMessage = AudioFileSupport.playbackErrorMessage(error)
         }
     }
 
@@ -197,13 +208,14 @@ final class LibraryState {
             return
         }
 
-        if playbackEngine.isLoaded {
+        if let playbackID, playbackEngine.isLoaded(playbackID) {
             do {
-                try playbackEngine.resume()
-                isPlaying = true
-                statusMessage = "Playing \(nowPlayingTitle)."
+                try playbackEngine.resume(playbackID)
+                isPlaying = playbackEngine.isPlaying(playbackID)
+                lastErrorMessage = nil
+                if isPlaying { statusMessage = "Playing \(nowPlayingTitle)." }
             } catch {
-                lastErrorMessage = Self.shortError(error)
+                lastErrorMessage = AudioFileSupport.playbackErrorMessage(error)
             }
             return
         }
@@ -214,14 +226,15 @@ final class LibraryState {
     }
 
     func pause() {
-        playbackEngine.pause()
-        playbackTime = playbackEngine.currentTime
+        if let playbackID { playbackEngine.pause(playbackID) }
+        playbackTime = playbackID.map { playbackEngine.currentTime($0) } ?? 0
         isPlaying = false
         statusMessage = "Paused."
     }
 
     func stop() {
-        playbackEngine.stop()
+        playbackEngine.stopAll()
+        playbackID = nil
         playbackTime = 0
         playbackDuration = 0
         isPlaying = false
@@ -251,22 +264,23 @@ final class LibraryState {
     func finishScrubbing() {
         defer { isScrubbing = false }
         do {
-            try playbackEngine.seek(to: playbackTime)
-            playbackTime = playbackEngine.currentTime
-            isPlaying = playbackEngine.isPlaying
+            guard let playbackID else { return }
+            try playbackEngine.seek(playbackID, to: playbackTime)
+            playbackTime = playbackEngine.isLoaded(playbackID) ? playbackEngine.currentTime(playbackID) : playbackDuration
+            isPlaying = playbackEngine.isPlaying(playbackID)
         } catch {
-            lastErrorMessage = Self.shortError(error)
+            lastErrorMessage = AudioFileSupport.playbackErrorMessage(error)
         }
     }
 
     func updateMetadata(for track: LibraryTrack, title: String, emoji: String) {
         let cleanedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanedEmoji = Self.cleanEmoji(emoji) ?? defaultEmoji
+        let cleanedEmoji = AudioFileSupport.cleanEmoji(emoji) ?? defaultEmoji
         metadata.tracks[track.id] = LibraryTrackMetadata(
             title: cleanedTitle.isEmpty ? nil : cleanedTitle,
             emoji: cleanedEmoji
         )
-        saveMetadata()
+        guard saveMetadata() else { return }
         refresh()
         if nowPlayingTrackID == track.id {
             nowPlayingTitle = cleanedTitle.isEmpty ? track.derivedTitle : cleanedTitle
@@ -276,7 +290,7 @@ final class LibraryState {
 
     func clearMetadata(for track: LibraryTrack) {
         metadata.tracks.removeValue(forKey: track.id)
-        saveMetadata()
+        guard saveMetadata() else { return }
         refresh()
         if nowPlayingTrackID == track.id {
             nowPlayingTitle = track.derivedTitle
@@ -286,7 +300,8 @@ final class LibraryState {
 
     func teardown() {
         cancelDownload()
-        playbackEngine.stop()
+        playbackEngine.stopAll()
+        playbackID = nil
         progressTimer?.invalidate()
         progressTimer = nil
     }
@@ -340,7 +355,7 @@ final class LibraryState {
         var discoveredTracks: [LibraryTrack] = []
         for case let url as URL in enumerator {
             let fileExtension = url.pathExtension.lowercased()
-            guard supportedExtensions.contains(fileExtension) else { continue }
+            guard AudioFileSupport.supportedExtensions.contains(fileExtension) else { continue }
             let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
             guard values?.isRegularFile != false else { continue }
 
@@ -396,15 +411,15 @@ final class LibraryState {
     }
 
     private func updatePlaybackProgress() {
-        guard playbackEngine.isLoaded else { return }
-        playbackDuration = playbackEngine.duration
+        guard let playbackID, playbackEngine.isPlaying(playbackID) else { return }
+        let time = playbackEngine.currentTime(playbackID)
         if !isScrubbing {
-            playbackTime = playbackEngine.currentTime
+            playbackTime = time
         }
-        isPlaying = playbackEngine.isPlaying
     }
 
     private func finishPlayback() {
+        playbackID = nil
         playbackTime = playbackDuration
         isPlaying = false
         statusMessage = "Finished \(nowPlayingTitle)."
@@ -429,15 +444,17 @@ final class LibraryState {
         }
     }
 
-    private func saveMetadata() {
+    private func saveMetadata() -> Bool {
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(metadata)
             try data.write(to: metadataURL, options: .atomic)
             lastErrorMessage = nil
+            return true
         } catch {
             lastErrorMessage = "Library labels could not be saved."
+            return false
         }
     }
 
@@ -464,12 +481,6 @@ final class LibraryState {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func cleanEmoji(_ value: String) -> String? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let first = trimmed.first else { return nil }
-        return String(first)
-    }
-
     private static func cleanTitle(from url: URL) -> String {
         let rawName = url.deletingPathExtension().lastPathComponent
         let withoutIndex = rawName.replacingOccurrences(
@@ -490,13 +501,6 @@ final class LibraryState {
         return result.isEmpty ? rawName : result
     }
 
-    private static func shortError(_ error: Error) -> String {
-        let message = error.localizedDescription
-        if message == "The operation couldn’t be completed. (com.apple.coreaudio.avfaudio error 1685348671.)" {
-            return "That file could not be played."
-        }
-        return message
-    }
 }
 
 private struct LibraryMetadataFile: Codable {
@@ -506,11 +510,4 @@ private struct LibraryMetadataFile: Codable {
 private struct LibraryTrackMetadata: Codable {
     var title: String?
     var emoji: String?
-}
-
-private extension String {
-    var nilIfBlank: String? {
-        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
 }

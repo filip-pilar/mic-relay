@@ -4,10 +4,6 @@ struct DownloaderToolStatus: Sendable {
     let ytDLPPath: String?
     let ffmpegPath: String?
 
-    var hasRequiredTools: Bool {
-        ytDLPPath != nil && ffmpegPath != nil
-    }
-
     var missingMessage: String? {
         if ytDLPPath == nil && ffmpegPath == nil {
             return "Install yt-dlp and ffmpeg with Homebrew."
@@ -45,6 +41,7 @@ final class LibraryDownloader {
         into folderURL: URL,
         progress: @escaping @MainActor (String, Double?) -> Void
     ) async throws {
+        try Task.checkCancellation()
         let trimmedURL = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedURL.isEmpty else {
             throw LibraryDownloadError.emptyURL
@@ -103,6 +100,7 @@ final class LibraryDownloader {
         let handleData: @Sendable (Data) -> Void = { [weak self] data in
             guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return }
             Task { @MainActor in
+                guard self?.process === process else { return }
                 self?.consumeOutput(text, progress: progress)
             }
         }
@@ -129,6 +127,7 @@ final class LibraryDownloader {
         outputPipe.fileHandleForReading.readabilityHandler = nil
         errorPipe.fileHandleForReading.readabilityHandler = nil
         self.process = nil
+        try Task.checkCancellation()
 
         guard terminationStatus == 0 else {
             throw LibraryDownloadError.failed(Self.shortFailure(from: outputBuffer))
@@ -138,9 +137,8 @@ final class LibraryDownloader {
     }
 
     func cancel() {
-        guard let process else { return }
+        guard let process, process.isRunning else { return }
         process.terminate()
-        self.process = nil
     }
 
     private func consumeOutput(

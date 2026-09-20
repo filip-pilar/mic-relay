@@ -1,167 +1,196 @@
-@preconcurrency import AudioToolbox
 @preconcurrency import AVFoundation
+import Accelerate
 import CoreAudio
 import Foundation
 
+/// A bounded capture/render queue. Prefill absorbs callback jitter, never gates by volume.
 final class PCMRingBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var left: [Float]
     private var right: [Float]
     private var readIndex = 0
     private var writeIndex = 0
-    private var availableFrames = 0
+    private var available = 0
+    private var primed = false
+    private let prefillFrames: Int
+    let meter = AudioMeter()
 
-    init(capacityFrames: Int) {
-        left = Array(repeating: 0, count: capacityFrames)
-        right = Array(repeating: 0, count: capacityFrames)
+    init(capacityFrames: Int = 12_000, prefillFrames: Int = 1_920) {
+        precondition(capacityFrames > 0 && prefillFrames >= 0 && prefillFrames <= capacityFrames)
+        left = .init(repeating: 0, count: capacityFrames)
+        right = .init(repeating: 0, count: capacityFrames)
+        self.prefillFrames = prefillFrames
     }
-
-    var capacityFrames: Int { left.count }
 
     func clear() {
         lock.lock()
         readIndex = 0
         writeIndex = 0
-        availableFrames = 0
+        available = 0
+        primed = false
         lock.unlock()
+        _ = meter.consumePeak()
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {
+        guard buffer.format == MicRelayConstants.processingFormat, let channels = buffer.floatChannelData else { return }
+        write(left: channels[0], right: channels[1], frameCount: Int(buffer.frameLength))
+        meter.record(buffer)
     }
 
     func write(left inputLeft: UnsafePointer<Float>, right inputRight: UnsafePointer<Float>, frameCount: Int) {
+        guard frameCount > 0 else { return }
         lock.lock()
-        for frame in 0..<frameCount {
-            left[writeIndex] = inputLeft[frame]
-            right[writeIndex] = inputRight[frame]
-            writeIndex = (writeIndex + 1) % capacityFrames
-            if availableFrames == capacityFrames {
-                readIndex = (readIndex + 1) % capacityFrames
-            } else {
-                availableFrames += 1
-            }
+        defer { lock.unlock() }
+        let count = min(frameCount, left.count)
+        let skipped = frameCount - count
+        let overflow = max(0, available + count - left.count)
+        readIndex = (readIndex + overflow) % left.count
+        var copied = 0
+        while copied < count {
+            let chunk = min(count - copied, left.count - writeIndex)
+            left.withUnsafeMutableBufferPointer { $0.baseAddress!.advanced(by: writeIndex).update(from: inputLeft + skipped + copied, count: chunk) }
+            right.withUnsafeMutableBufferPointer { $0.baseAddress!.advanced(by: writeIndex).update(from: inputRight + skipped + copied, count: chunk) }
+            writeIndex = (writeIndex + chunk) % left.count
+            copied += chunk
         }
+        available = min(left.count, available + count)
+    }
+
+    func read(into output: UnsafeMutableAudioBufferListPointer, frameCount: Int) {
+        for buffer in output {
+            buffer.mData?.assumingMemoryBound(to: Float.self).update(repeating: 0, count: frameCount * Int(buffer.mNumberChannels))
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        if !primed {
+            guard available >= max(prefillFrames, frameCount) else { return }
+            primed = true
+        }
+        let count = min(frameCount, available)
+        var copied = 0
+        while copied < count {
+            let chunk = min(count - copied, left.count - readIndex)
+            if output.count == 2 {
+                left.withUnsafeBufferPointer { output[0].mData!.assumingMemoryBound(to: Float.self).advanced(by: copied).update(from: $0.baseAddress! + readIndex, count: chunk) }
+                right.withUnsafeBufferPointer { output[1].mData!.assumingMemoryBound(to: Float.self).advanced(by: copied).update(from: $0.baseAddress! + readIndex, count: chunk) }
+            } else if let data = output[0].mData?.assumingMemoryBound(to: Float.self) {
+                let channels = Int(output[0].mNumberChannels)
+                for frame in 0..<chunk {
+                    data[(copied + frame) * channels] = left[readIndex + frame]
+                    if channels > 1 { data[(copied + frame) * channels + 1] = right[readIndex + frame] }
+                }
+            }
+            readIndex = (readIndex + chunk) % left.count
+            copied += chunk
+        }
+        available -= count
+        if count < frameCount { primed = false }
+    }
+}
+
+/// Capture callbacks accumulate peaks; the UI samples them at a fixed rate.
+final class AudioMeter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var peak: Float = 0
+
+    func record(_ buffer: AVAudioPCMBuffer) {
+        guard let channels = buffer.floatChannelData, buffer.frameLength > 0 else { return }
+        var value: Float = 0
+        let buffers = buffer.format.isInterleaved ? 1 : Int(buffer.format.channelCount)
+        let samples = Int(buffer.frameLength) * (buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1)
+        for channel in 0..<buffers {
+            var channelPeak: Float = 0
+            vDSP_maxmgv(channels[channel], 1, &channelPeak, vDSP_Length(samples))
+            value = max(value, channelPeak)
+        }
+        lock.lock()
+        peak = max(peak, value)
         lock.unlock()
     }
 
-    func read(into ioData: UnsafeMutableAudioBufferListPointer, frameCount: Int) {
+    func consumePeak() -> Float {
         lock.lock()
-        for frame in 0..<frameCount {
-            let sampleLeft: Float
-            let sampleRight: Float
-            if availableFrames > 0 {
-                sampleLeft = left[readIndex]
-                sampleRight = right[readIndex]
-                readIndex = (readIndex + 1) % capacityFrames
-                availableFrames -= 1
-            } else {
-                sampleLeft = 0
-                sampleRight = 0
-            }
-
-            for bufferIndex in 0..<ioData.count {
-                let channels = Int(ioData[bufferIndex].mNumberChannels)
-                guard let data = ioData[bufferIndex].mData?.assumingMemoryBound(to: Float.self) else { continue }
-                if ioData.count == 1 {
-                    let base = frame * channels
-                    data[base] = sampleLeft
-                    if channels > 1 {
-                        data[base + 1] = sampleRight
-                    }
-                } else if bufferIndex == 0 {
-                    data[frame] = sampleLeft
-                } else {
-                    data[frame] = sampleRight
-                }
-            }
-        }
-        lock.unlock()
+        defer { lock.unlock() }
+        let value = peak
+        peak = 0
+        return value
     }
 }
 
 @MainActor
 final class AudioMixer {
-    let musicBuffer = PCMRingBuffer(capacityFrames: 48_000 * 3)
-    let microphoneBuffer = PCMRingBuffer(capacityFrames: 48_000 * 3)
-
+    let musicBuffer = PCMRingBuffer()
+    let microphoneBuffer = PCMRingBuffer()
+    let outputMeter = AudioMeter()
+    var onFailure: (@MainActor (Error) -> Void)?
     private var engine: AVAudioEngine?
-    private var musicSourceNode: AVAudioSourceNode?
-    private var microphoneSourceNode: AVAudioSourceNode?
-    private var musicMixerNode: AVAudioMixerNode?
-    private var microphoneMixerNode: AVAudioMixerNode?
-    private(set) var isRunning = false
+    private var configurationObserver: NSObjectProtocol?
+    private var musicMixer: AVAudioMixerNode?
+    private var microphoneMixer: AVAudioMixerNode?
 
-    func start(
-        blackHoleDeviceID: AudioDeviceID,
-        includeMicrophone: Bool
-    ) throws {
+    func start(blackHoleDeviceID: AudioDeviceID, musicVolume: Float, microphoneVolume: Float) throws {
         stop()
-        musicBuffer.clear()
-        microphoneBuffer.clear()
-
         let engine = AVAudioEngine()
-        let format = MicRelayConstants.processingFormat
-
-        let musicSourceNode = Self.makeSourceNode(buffer: musicBuffer)
-        let microphoneSourceNode = Self.makeSourceNode(buffer: microphoneBuffer)
-
-        let musicMixer = AVAudioMixerNode()
-        let microphoneMixer = AVAudioMixerNode()
-        musicMixer.outputVolume = 1
-        microphoneMixer.outputVolume = includeMicrophone ? 1 : 0
-
-        engine.attach(musicSourceNode)
-        engine.attach(microphoneSourceNode)
-        engine.attach(musicMixer)
-        engine.attach(microphoneMixer)
-        engine.connect(musicSourceNode, to: musicMixer, format: format)
-        engine.connect(microphoneSourceNode, to: microphoneMixer, format: format)
-        engine.connect(musicMixer, to: engine.mainMixerNode, format: format)
-        engine.connect(microphoneMixer, to: engine.mainMixerNode, format: format)
-
-        var blackHoleID = blackHoleDeviceID
-        let outputStatus = AudioUnitSetProperty(
-            engine.outputNode.audioUnit!,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &blackHoleID,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        guard outputStatus == noErr else {
-            throw MicRelayError.propertyError(outputStatus)
+        try engine.setOutputDevice(blackHoleDeviceID)
+        let musicMixer = attach(musicBuffer, to: engine)
+        let microphoneMixer = attach(microphoneBuffer, to: engine)
+        musicMixer.outputVolume = musicVolume
+        microphoneMixer.outputVolume = microphoneVolume
+        let meter = outputMeter
+        engine.mainMixerNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { @Sendable buffer, _ in
+            meter.record(buffer)
         }
-
-        try engine.start()
-
         self.engine = engine
-        self.musicSourceNode = musicSourceNode
-        self.microphoneSourceNode = microphoneSourceNode
-        self.musicMixerNode = musicMixer
-        self.microphoneMixerNode = microphoneMixer
-        isRunning = true
+        self.musicMixer = musicMixer
+        self.microphoneMixer = microphoneMixer
+        configurationObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil) { [weak self, weak engine] _ in
+            // Hardware format changes stop AVAudioEngine. Leave its internal notification queue
+            // before restarting; a queued notification must not revive an intentionally stopped relay.
+            Task { @MainActor in
+                guard let self, let engine, self.engine === engine, !engine.isRunning else { return }
+                do { try engine.start() }
+                catch { self.onFailure?(error) }
+            }
+        }
+        do {
+            engine.prepare()
+            try engine.start()
+        } catch {
+            stop()
+            throw error
+        }
     }
 
-    func setMicrophoneIncluded(_ included: Bool) {
-        microphoneMixerNode?.outputVolume = included ? 1 : 0
+    func setVolumes(music: Float, microphone: Float) {
+        musicMixer?.outputVolume = music
+        microphoneMixer?.outputVolume = microphone
     }
 
     func stop() {
+        if let configurationObserver { NotificationCenter.default.removeObserver(configurationObserver) }
+        configurationObserver = nil
         engine?.stop()
+        engine?.mainMixerNode.removeTap(onBus: 0)
         engine = nil
-        musicSourceNode = nil
-        microphoneSourceNode = nil
-        musicMixerNode = nil
-        microphoneMixerNode = nil
-        isRunning = false
+        musicMixer = nil
+        microphoneMixer = nil
         musicBuffer.clear()
         microphoneBuffer.clear()
+        _ = outputMeter.consumePeak()
     }
 
-    nonisolated private static func makeSourceNode(buffer: PCMRingBuffer) -> AVAudioSourceNode {
-        AVAudioSourceNode { _, _, frameCount, audioBufferList -> OSStatus in
-            buffer.read(
-                into: UnsafeMutableAudioBufferListPointer(audioBufferList),
-                frameCount: Int(frameCount)
-            )
+    private func attach(_ buffer: PCMRingBuffer, to engine: AVAudioEngine) -> AVAudioMixerNode {
+        let format = MicRelayConstants.processingFormat
+        let source = AVAudioSourceNode(format: format) { @Sendable _, _, count, output -> OSStatus in
+            buffer.read(into: UnsafeMutableAudioBufferListPointer(output), frameCount: Int(count))
             return noErr
         }
+        let mixer = AVAudioMixerNode()
+        engine.attach(source)
+        engine.attach(mixer)
+        engine.connect(source, to: mixer, format: format)
+        engine.connect(mixer, to: engine.mainMixerNode, format: format)
+        return mixer
     }
 }

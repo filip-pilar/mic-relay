@@ -1,434 +1,276 @@
 import AppKit
 import AVFoundation
-import CoreGraphics
 import CoreAudio
+import CoreGraphics
 import Foundation
+
+enum RelayPhase { case stopped, starting, sharing }
 
 @MainActor
 @Observable
 final class AppState {
-    var currentMode: AudioMode = .stopped
-    var isBlackHoleInstalled = false
+    private(set) var phase: RelayPhase = .stopped
+    private(set) var blackHoleDeviceID: AudioDeviceID?
+    private(set) var musicSources: [MusicSource] = []
+    private(set) var microphoneSources: [MicrophoneSource] = []
+    private(set) var isFindingApps = false
+    private(set) var microphoneAuthorization: AVAuthorizationStatus = .notDetermined
+    private(set) var screenCapturePermissionGranted = false
+    private(set) var levels = AudioLevels()
     var errorMessage: String?
-    var musicSources: [MusicSource] = []
-    var selectedMusicSource: MusicSource?
-    var microphoneSources: [MicrophoneSource] = []
-    var selectedMicrophoneID: String?
-    var levels = AudioLevels()
-    var sendToCall = false
-    var isRouting = false
-    var microphonePermissionGranted = false
-    var screenCapturePermissionGranted = false
-    var capturePermissionHint = "Click Refresh Music Apps to list Spotify or another app."
-    var sourceDiagnostic = "Music apps are not scanned automatically so macOS does not prompt on launch."
-    var audioStatusMessage = "Audio devices ready to scan."
-    var soundboard = SoundboardState()
-    var library = LibraryState()
 
-    let audioManager = AudioDeviceManager()
-    private let mixer = AudioMixer()
-    private let appAudioCapture = AppAudioCapture()
-    private let microphoneCapture = MicrophoneCapture()
-
-    @ObservationIgnored private var hasTornDown = false
-    @ObservationIgnored private var terminationObserver: Any?
-    @ObservationIgnored private var levelDecayTimer: Timer?
-
-    init() {
-        setupTerminationHandler()
-        setupAudioCallbacks()
-        startLevelDecayTimer()
-        audioManager.cleanupOrphanedMicRelayDevices()
-        refreshAudioDevices()
-        refreshScreenCapturePermissionStatus()
-        refreshMicrophonePermissionStatus()
+    var selectedMusicBundleID: String {
+        didSet {
+            defaults.set(selectedMusicBundleID, forKey: "musicApp")
+            restartIfSharing()
+        }
     }
-
-    var blackHoleDevice: DeviceInfo? {
-        audioManager.blackHoleDevice
+    var selectedMicrophoneID: String {
+        didSet {
+            defaults.set(selectedMicrophoneID, forKey: "microphone")
+            restartIfSharing()
+        }
     }
+    var includeMicrophone: Bool {
+        didSet {
+            defaults.set(includeMicrophone, forKey: "includeMicrophone")
+            restartIfSharing()
+        }
+    }
+    var musicVolume: Float {
+        didSet {
+            defaults.set(musicVolume, forKey: "musicVolume")
+            updateVolumes()
+        }
+    }
+    var microphoneVolume: Float {
+        didSet {
+            defaults.set(microphoneVolume, forKey: "microphoneVolume")
+            updateVolumes()
+        }
+    }
+    let soundboard: SoundboardState
+    let library: LibraryState
 
-    func refreshAudioDevices() {
-        audioManager.refreshDevices()
-        isBlackHoleInstalled = BlackHoleDetector.detect(using: audioManager) == .installed
-
-        refreshMicrophoneSources()
-        if selectedMicrophoneID == nil || !microphoneSources.contains(where: { $0.id == selectedMicrophoneID }) {
-            selectedMicrophoneID = microphoneSources.first(where: \.isDefault)?.id ?? microphoneSources.first?.id
+    var isSharing: Bool { phase == .sharing }
+    var microphonePermissionGranted: Bool { microphoneAuthorization == .authorized }
+    var isBlackHoleInstalled: Bool { blackHoleDeviceID != nil }
+    var selectedMusicSource: MusicSource? { musicSources.first { $0.bundleIdentifier == selectedMusicBundleID } }
+    var statusText: String {
+        switch phase {
+        case .stopped: "Local playback"
+        case .starting: "Connecting…"
+        case .sharing: "Sharing to BlackHole"
         }
     }
 
-    func refreshScreenCapturePermissionStatus() {
+    @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private let audioManager = AudioDeviceManager()
+    @ObservationIgnored private let mixer = AudioMixer()
+    @ObservationIgnored private let appCapture = AppAudioCapture()
+    @ObservationIgnored private let microphoneCapture = MicrophoneCapture()
+    @ObservationIgnored private var routingTask: Task<Void, Never>?
+    @ObservationIgnored private var observers: [Any] = []
+    @ObservationIgnored private var levelTimer: Timer?
+    @ObservationIgnored private var generation = 0
+    @ObservationIgnored private var isRefreshingDevices = false
+
+    init(defaults: UserDefaults = .standard, library: LibraryState = LibraryState(), soundboard: SoundboardState = SoundboardState()) {
+        self.defaults = defaults
+        self.library = library
+        self.soundboard = soundboard
+        selectedMusicBundleID = defaults.string(forKey: "musicApp") ?? ""
+        selectedMicrophoneID = defaults.string(forKey: "microphone") ?? ""
+        includeMicrophone = defaults.bool(forKey: "includeMicrophone")
+        musicVolume = min(1, max(0, (defaults.object(forKey: "musicVolume") as? NSNumber)?.floatValue ?? 1))
+        microphoneVolume = min(1, max(0, (defaults.object(forKey: "microphoneVolume") as? NSNumber)?.floatValue ?? 1))
+        let musicBuffer = mixer.musicBuffer
+        let micBuffer = mixer.microphoneBuffer
+        appCapture.onAudioBuffer = { musicBuffer.append($0) }
+        microphoneCapture.onAudioBuffer = { micBuffer.append($0) }
+        mixer.onFailure = { [weak self] error in
+            self?.stopSharing()
+            self?.errorMessage = "Audio output stopped: \(error.localizedDescription). Try Start Sharing again."
+        }
+        appCapture.onFailure = { [weak self] error in
+            self?.stopSharing()
+            self?.errorMessage = "App audio stopped: \(error.localizedDescription). Try Start Sharing again."
+        }
+        audioManager.onDevicesChanged = { [weak self] in self?.refreshDevices() }
+        audioManager.startListeningForDeviceChanges()
+        refreshDevices()
+        refreshPermissions()
+        observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshPermissions(); self?.refreshDevices() }
+        })
+        observers.append(NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.teardown() }
+        })
+        levelTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 15, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.sampleLevels() }
+        }
+    }
+
+    func refreshPermissions() {
         screenCapturePermissionGranted = CGPreflightScreenCaptureAccess()
+        microphoneAuthorization = AVCaptureDevice.authorizationStatus(for: .audio)
     }
 
-    func refreshSources() async {
-        refreshScreenCapturePermissionStatus()
-        capturePermissionHint = screenCapturePermissionGranted
-            ? "macOS reports Screen & System Audio Recording is enabled."
-            : "macOS may ask for Screen & System Audio Recording permission."
-
-        do {
-            musicSources = try await appAudioCapture.availableSources()
-            if let spotify = musicSources.first(where: \.isSpotify) {
-                selectedMusicSource = spotify
-            } else if selectedMusicSource == nil || !musicSources.contains(where: { $0 == selectedMusicSource }) {
-                selectedMusicSource = musicSources.first
-            }
-            refreshScreenCapturePermissionStatus()
-            if musicSources.isEmpty {
-                sourceDiagnostic = "ScreenCaptureKit succeeded, but returned 0 apps. Make sure Spotify is running; if it is, quit and reopen Mic Relay after toggling the permission."
-            } else {
-                sourceDiagnostic = "Found \(musicSources.count) capturable app\(musicSources.count == 1 ? "" : "s")."
-            }
-            capturePermissionHint = screenCapturePermissionGranted
-                ? "Ready to capture app audio."
-                : "macOS still reports Screen & System Audio Recording as not granted."
-        } catch {
-            musicSources = []
-            selectedMusicSource = nil
-            refreshScreenCapturePermissionStatus()
-            capturePermissionHint = "Screen & System Audio Recording permission is needed for app audio capture."
-            sourceDiagnostic = Self.describeCaptureError(error)
+    func refreshDevices() {
+        isRefreshingDevices = true
+        let oldDevice = blackHoleDeviceID
+        let oldMicrophone = selectedMicrophoneID
+        blackHoleDeviceID = audioManager.findBlackHoleDevice()
+        let defaultID = AVCaptureDevice.default(for: .audio)?.uniqueID
+        microphoneSources = MicrophoneCapture.availableMicrophones().map {
+            MicrophoneSource(id: $0.uniqueID, name: $0.localizedName, isDefault: $0.uniqueID == defaultID)
+        }.sorted { left, right in
+            if left.isDefault != right.isDefault { return left.isDefault }
+            return left.name.localizedCaseInsensitiveCompare(right.name) == .orderedAscending
         }
-    }
-
-    func refreshMicrophonePermission() async {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            microphonePermissionGranted = true
-        case .notDetermined:
-            microphonePermissionGranted = await AVCaptureDevice.requestAccess(for: .audio)
-        default:
-            microphonePermissionGranted = false
+        if !microphoneSources.contains(where: { $0.id == selectedMicrophoneID }) {
+            selectedMicrophoneID = microphoneSources.first?.id ?? ""
         }
-        refreshMicrophoneSources()
-    }
-
-    func refreshMicrophonePermissionStatus() {
-        microphonePermissionGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-        refreshMicrophoneSources()
-    }
-
-    func switchMode(to mode: AudioMode) {
-        Task {
-            await startRouting(mode: mode)
-        }
-    }
-
-    func setRouting(_ enabled: Bool, includeMicrophone: Bool) {
-        if enabled {
-            guard sendToCall else {
-                errorMessage = "Turn on Send to Call first."
-                return
-            }
-            switchMode(to: includeMicrophone ? .musicAndVoice : .musicOnly)
-        } else {
-            stopRouting()
-        }
-    }
-
-    func setSendToCall(_ enabled: Bool) {
-        if enabled {
-            refreshAudioDevices()
-            guard isBlackHoleInstalled else {
-                sendToCall = false
-                audioStatusMessage = "BlackHole is needed to send audio to calls."
-                return
-            }
-            sendToCall = true
-            errorMessage = nil
-            audioStatusMessage = "Send to Call is on."
-        } else {
-            sendToCall = false
-            stopRouting()
-            soundboard.stopAll()
+        isRefreshingDevices = false
+        guard phase != .stopped else { return }
+        if blackHoleDeviceID == nil {
+            stopSharing()
+            errorMessage = "BlackHole disconnected. Reconnect it, then start sharing again."
+        } else if oldDevice != blackHoleDeviceID || (includeMicrophone && oldMicrophone != selectedMicrophoneID) {
+            // Files also hold the previous device ID.
             library.stop()
-            audioStatusMessage = "Send to Call is off. Sounds play locally."
+            soundboard.stopAll()
+            startSharing()
         }
     }
 
-    func setMicrophoneIncluded(_ included: Bool) {
-        mixer.setMicrophoneIncluded(included)
-        if isRouting {
-            if included && currentMode == .musicOnly {
-                switchMode(to: .musicAndVoice)
-                return
-            }
-            if !included {
-                microphoneCapture.stop()
-                levels.microphone = 0
-            }
-            currentMode = included ? .musicAndVoice : .musicOnly
-            updateOutputLevel()
+    func findMusicApps() async {
+        guard !isFindingApps else { return }
+        isFindingApps = true
+        defer { isFindingApps = false }
+        if !CGPreflightScreenCaptureAccess() {
+            CGRequestScreenCaptureAccess()
         }
-    }
-
-    func startRouting(mode: AudioMode) async {
-        guard mode != .stopped else {
-            stopRouting()
-            return
-        }
-
-        refreshAudioDevices()
-        guard isBlackHoleInstalled, let blackHoleID = audioManager.findDevice(byUID: MicRelayConstants.blackHoleUID) else {
-            failRouting("BlackHole 2ch is not installed or not visible to CoreAudio.")
-            return
-        }
-
-        if mode.includesMicrophone {
-            await refreshMicrophonePermission()
-            guard microphonePermissionGranted else {
-                failRouting(MicRelayError.microphonePermissionRequired.localizedDescription)
-                return
-            }
-        }
-
-        if musicSources.isEmpty {
-            await refreshSources()
-        }
-        guard let selectedMusicSource else {
-            failRouting("Start Spotify or another music app, then click Refresh Sources.")
-            return
-        }
-
-        let microphoneID: String?
-        if mode.includesMicrophone {
-            refreshMicrophoneSources()
-            guard let id = selectedMicrophoneID,
-                  microphoneSources.contains(where: { $0.id == id })
-            else {
-                failRouting("The selected microphone is no longer available.")
-                return
-            }
-            microphoneID = id
-        } else {
-            microphoneID = nil
-        }
-
         do {
-            appAudioCapture.stop()
-            microphoneCapture.stop()
-            mixer.stop()
-            try mixer.start(
-                blackHoleDeviceID: blackHoleID,
-                includeMicrophone: mode.includesMicrophone
-            )
-            try await appAudioCapture.start(
-                source: selectedMusicSource
-            )
-            if let microphoneID {
-                try microphoneCapture.start(deviceID: microphoneID)
+            musicSources = try await appCapture.availableSources()
+            screenCapturePermissionGranted = true
+            if defaults.object(forKey: "musicApp") == nil {
+                selectedMusicBundleID = musicSources.first(where: \.isSpotify)?.bundleIdentifier ?? musicSources.first?.bundleIdentifier ?? ""
             }
-            currentMode = mode
-            isRouting = true
-            errorMessage = nil
+            errorMessage = musicSources.isEmpty ? "No apps found. Open your music app, then refresh." : nil
         } catch {
-            failRouting(error.localizedDescription)
+            refreshPermissions()
+            errorMessage = "App audio access is unavailable. Open Screen & System Audio Recording in Setup, allow Mic Relay, then quit and reopen it if macOS asks."
         }
     }
 
-    func stopRouting() {
-        appAudioCapture.stop()
-        microphoneCapture.stop()
+    func requestMicrophoneAccess() async {
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+            _ = await AVCaptureDevice.requestAccess(for: .audio)
+        }
+        refreshPermissions()
+    }
+
+    func toggleSharing() {
+        if phase == .stopped {
+            // A destination change must never leave a local preview mislabeled as shared.
+            library.stop()
+            soundboard.stopAll()
+            startSharing()
+        } else { stopSharing() }
+    }
+
+    private func restartIfSharing() {
+        guard !isRefreshingDevices, phase != .stopped else { return }
+        startSharing()
+    }
+
+    private func startSharing() {
+        generation += 1
+        let request = generation
+        let previous = routingTask
+        previous?.cancel()
+        mixer.stop()
+        phase = .starting
+        errorMessage = nil
+        // Serialize capture teardown/start. A superseded permission prompt cannot re-enable routing.
+        routingTask = Task { [weak self] in
+            await previous?.value
+            guard let self, !Task.isCancelled else { return }
+            await appCapture.stop()
+            await microphoneCapture.stop()
+            do {
+                try Task.checkCancellation()
+                guard let device = blackHoleDeviceID else { throw MicRelayError.deviceNotFound("BlackHole 2ch — install it in Setup") }
+                if includeMicrophone {
+                    await requestMicrophoneAccess()
+                    try Task.checkCancellation()
+                    guard microphonePermissionGranted else { throw MicRelayError.microphonePermissionRequired }
+                }
+                if !selectedMusicBundleID.isEmpty {
+                    if selectedMusicSource == nil { await findMusicApps() }
+                    try Task.checkCancellation()
+                    guard let source = selectedMusicSource else { throw MicRelayError.musicSourceNotAvailable }
+                    try await appCapture.start(source: source)
+                }
+                try Task.checkCancellation()
+                if includeMicrophone { try await microphoneCapture.start(deviceID: selectedMicrophoneID) }
+                try Task.checkCancellation()
+                try mixer.start(blackHoleDeviceID: device, musicVolume: musicVolume, microphoneVolume: includeMicrophone ? microphoneVolume : 0)
+                phase = .sharing
+            } catch {
+                await appCapture.stop()
+                await microphoneCapture.stop()
+                guard generation == request else { return }
+                mixer.stop()
+                library.stop()
+                soundboard.stopAll()
+                phase = .stopped
+                if !(error is CancellationError) { errorMessage = error.localizedDescription }
+            }
+        }
+    }
+
+    func stopSharing() {
+        generation += 1
+        phase = .stopped
+        let previous = routingTask
+        previous?.cancel()
         mixer.stop()
         levels = AudioLevels()
-        currentMode = .stopped
-        isRouting = false
-    }
-
-    func rescanAudioDevices() {
-        refreshAudioDevices()
-        refreshMicrophoneSources()
-        refreshScreenCapturePermissionStatus()
-        audioStatusMessage = "Rescanned: \(microphoneSources.count) mic\(microphoneSources.count == 1 ? "" : "s"), BlackHole \(isBlackHoleInstalled ? "found" : "missing")."
-    }
-
-    func refreshMusicSources() {
-        Task {
-            await refreshSources()
+        soundboard.stopAll()
+        library.stop()
+        routingTask = Task { [appCapture, microphoneCapture] in
+            await previous?.value
+            await appCapture.stop()
+            await microphoneCapture.stop()
         }
     }
 
-    func openScreenCaptureSettings() {
-        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
-        NSWorkspace.shared.open(url)
+    private func updateVolumes() {
+        mixer.setVolumes(music: musicVolume, microphone: includeMicrophone ? microphoneVolume : 0)
+    }
+
+    private func sampleLevels() {
+        let music = mixer.musicBuffer.meter.consumePeak()
+        let mic = mixer.microphoneBuffer.meter.consumePeak()
+        let output = mixer.outputMeter.consumePeak()
+        guard isSharing else { levels = AudioLevels(); return }
+        levels = AudioLevels(music: max(music, levels.music * 0.75), microphone: includeMicrophone ? max(mic, levels.microphone * 0.75) : 0, output: max(output, levels.output * 0.75))
+    }
+
+    func openPrivacySettings(microphone: Bool = false) {
+        let pane = microphone ? "Privacy_Microphone" : "Privacy_ScreenCapture"
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)")!)
     }
 
     func teardown() {
-        guard !hasTornDown else { return }
-        hasTornDown = true
-        sendToCall = false
-        stopRouting()
-        soundboard.stopAll()
+        stopSharing()
         library.teardown()
-        levelDecayTimer?.invalidate()
-        levelDecayTimer = nil
+        levelTimer?.invalidate()
+        levelTimer = nil
         audioManager.stopListeningForDeviceChanges()
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers.removeAll()
     }
-
-    private func setupAudioCallbacks() {
-        let musicBuffer = mixer.musicBuffer
-        appAudioCapture.onAudioBuffer = { [weak self] buffer in
-            Self.appendMusic(buffer, to: musicBuffer)
-            let value = Self.rms(buffer)
-            Task { @MainActor in
-                self?.levels.music = value
-                self?.updateOutputLevel()
-            }
-        }
-        let microphoneBuffer = mixer.microphoneBuffer
-        microphoneCapture.onAudioBuffer = { [weak self] buffer in
-            Self.appendMusic(buffer, to: microphoneBuffer)
-            let value = Self.rms(buffer)
-            Task { @MainActor in
-                guard self?.currentMode.includesMicrophone == true else {
-                    self?.levels.microphone = 0
-                    self?.updateOutputLevel()
-                    return
-                }
-                self?.levels.microphone = value
-                self?.updateOutputLevel()
-            }
-        }
-        audioManager.onDevicesChanged = { [weak self] in
-            self?.handleDeviceChange()
-        }
-        audioManager.startListeningForDeviceChanges()
-    }
-
-    private func startLevelDecayTimer() {
-        levelDecayTimer?.invalidate()
-        levelDecayTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.decayLevels()
-            }
-        }
-    }
-
-    private func decayLevels() {
-        guard isRouting else {
-            levels = AudioLevels()
-            return
-        }
-
-        levels.music = Self.decay(levels.music)
-        if currentMode.includesMicrophone {
-            levels.microphone = Self.decay(levels.microphone)
-        } else {
-            levels.microphone = 0
-        }
-        updateOutputLevel()
-    }
-
-    private func updateOutputLevel() {
-        levels.output = max(levels.music, currentMode.includesMicrophone ? levels.microphone : 0)
-    }
-
-    private func refreshMicrophoneSources() {
-        let defaultMicrophoneID = AVCaptureDevice.default(for: .audio)?.uniqueID
-        let devices = MicrophoneCapture.availableMicrophones()
-
-        microphoneSources = devices
-            .map { device in
-                MicrophoneSource(
-                    id: device.uniqueID,
-                    name: device.localizedName,
-                    isDefault: defaultMicrophoneID == device.uniqueID
-                )
-            }
-            .sorted { left, right in
-                if left.isDefault != right.isDefault {
-                    return left.isDefault
-                }
-                return left.name.localizedCaseInsensitiveCompare(right.name) == .orderedAscending
-            }
-    }
-
-    nonisolated private static func appendMusic(_ buffer: AVAudioPCMBuffer, to musicBuffer: PCMRingBuffer) {
-        guard let channels = buffer.floatChannelData else { return }
-        let frameCount = Int(buffer.frameLength)
-        guard frameCount > 0 else { return }
-
-        if buffer.format.channelCount == 1 {
-            musicBuffer.write(left: channels[0], right: channels[0], frameCount: frameCount)
-        } else {
-            musicBuffer.write(left: channels[0], right: channels[1], frameCount: frameCount)
-        }
-    }
-
-    nonisolated private static func rms(_ buffer: AVAudioPCMBuffer) -> Float {
-        guard let channelData = buffer.floatChannelData else { return 0 }
-        let channelCount = Int(buffer.format.channelCount)
-        let frameLength = Int(buffer.frameLength)
-        guard channelCount > 0, frameLength > 0 else { return 0 }
-
-        var sum: Float = 0
-        for channel in 0..<channelCount {
-            let samples = channelData[channel]
-            for frame in 0..<frameLength {
-                let sample = samples[frame]
-                sum += sample * sample
-            }
-        }
-        let meanSquare = sum / Float(channelCount * frameLength)
-        return min(1, sqrt(meanSquare) * 3.5)
-    }
-
-    nonisolated private static func decay(_ value: Float) -> Float {
-        let decayed = value * 0.86
-        return decayed < 0.01 ? 0 : decayed
-    }
-
-    private func handleDeviceChange() {
-        let wasRouting = isRouting
-        let mode = currentMode
-        refreshAudioDevices()
-
-        guard isBlackHoleInstalled else {
-            sendToCall = false
-            soundboard.stopAll()
-            library.stop()
-            guard wasRouting else { return }
-            failRouting("BlackHole disappeared. Routing stopped.")
-            return
-        }
-
-        guard wasRouting else { return }
-
-        Task {
-            await startRouting(mode: mode)
-        }
-    }
-
-    private func failRouting(_ message: String) {
-        stopRouting()
-        errorMessage = message
-    }
-
-    private static func describeCaptureError(_ error: Error) -> String {
-        let nsError = error as NSError
-        var message = error.localizedDescription
-        if !nsError.domain.isEmpty {
-            message += " (\(nsError.domain) \(nsError.code))"
-        }
-        if nsError.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain" ||
-            nsError.domain == "com.apple.screencapturekit.error" {
-            message += ". Quit Mic Relay, toggle the permission off/on, reopen Mic Relay, then click Apps."
-        }
-        return message
-    }
-
-    private func setupTerminationHandler() {
-        terminationObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.willTerminateNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.teardown()
-            }
-        }
-    }
-
 }
